@@ -1,0 +1,525 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <title>HOTLINE: NEON PATHFINDER</title>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Monoton&family=Roboto+Mono:wght@700&display=swap');
+        
+        body, html { 
+            margin: 0; padding: 0; background: #000; overflow: hidden; 
+            width: 100vw; height: 100vh; cursor: crosshair; 
+        }
+
+        /* HARD VISUALS */
+        canvas { 
+            display: block; 
+            filter: contrast(1.6) saturate(1.9) brightness(1.1);
+        }
+
+        #ui { 
+            position: absolute; top: 20px; left: 20px; color: #fff; 
+            font-family: 'Roboto Mono', monospace; pointer-events: none; z-index: 10; 
+            text-shadow: 2px 2px #f0f, 0 0 10px #fff; 
+        }
+
+        #overlay { 
+            position: absolute; top: 0; left: 0; width: 100%; height: 100%; 
+            display: flex; flex-direction: column; justify-content: center; align-items: center; 
+            background: rgba(10, 0, 20, 0.96); z-index: 100; 
+        }
+
+        .title { 
+            font-family: 'Monoton'; font-size: 100px; color: #ff0; 
+            text-shadow: 10px 10px #f0f, 0 0 30px #ff0; margin: 0; 
+            animation: vaporWave 1s infinite alternate;
+        }
+
+        @keyframes vaporWave {
+            from { text-shadow: 10px 10px #f0f, 0 0 30px #ff0; }
+            to { text-shadow: 5px 5px #0ff, 0 0 40px #f0f; }
+        }
+
+        .btn { 
+            font-family: 'Roboto Mono'; font-size: 24px; color: #fff; 
+            background: none; border: 3px solid #fff; padding: 15px 40px;
+            margin-top: 40px; cursor: pointer; transition: 0.2s; text-transform: uppercase;
+        }
+
+        .btn:hover { 
+            background: #fff; color: #000; box-shadow: 0 0 30px #fff;
+        }
+    </style>
+</head>
+<body>
+
+<div id="ui">
+    <div style="font-size: 28px; color: #0ff;">STATUS: NEON PURSUIT</div>
+    <div id="stat">KILLS: 0 | TARGETS: 0</div>
+    <div style="font-size: 14px; color: #f0f;">ENEMIES OBEY TOPOLOGY | [R] REGENERATE</div>
+</div>
+
+<div id="overlay" onclick="initAudio(); start();">
+    <h1 class="title">HOTLINE</h1>
+    <div style="color:#fff; letter-spacing:8px; margin-top:20px; font-family:'Roboto Mono'">CLICK TO BREACH</div>
+</div>
+
+<canvas id="g"></canvas>
+
+<script>
+const cvs = document.getElementById('g');
+const ctx = cvs.getContext('2d');
+const overlay = document.getElementById('overlay');
+const statUI = document.getElementById('stat');
+
+let player, enemies = [], bullets = [], walls = [], blood = [], nodes = [];
+let shake = 0, score = 0, state = 'MENU', frame = 0;
+const keys = {};
+let audioCtx, mainGain;
+
+function initAudio() {
+    if (audioCtx) return;
+    audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    const bass = audioCtx.createOscillator();
+    const lfo = audioCtx.createOscillator();
+    const lfoG = audioCtx.createGain();
+    bass.type = 'sawtooth'; bass.frequency.value = 50; 
+    lfo.type = 'sine'; lfo.frequency.value = 3.5; lfoG.gain.value = 8;
+    mainGain = audioCtx.createGain(); mainGain.gain.value = 0.18;
+    lfo.connect(lfoG); lfoG.connect(bass.frequency);
+    bass.connect(mainGain); mainGain.connect(audioCtx.destination);
+    bass.start(); lfo.start();
+}
+
+function sfx(f, d, t='square') {
+    if(!audioCtx) return;
+    const o = audioCtx.createOscillator(), g = audioCtx.createGain();
+    o.type = t; o.frequency.setValueAtTime(f, audioCtx.currentTime);
+    o.frequency.exponentialRampToValueAtTime(0.01, audioCtx.currentTime+d);
+    g.gain.setValueAtTime(0.1, audioCtx.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.01, audioCtx.currentTime+d);
+    o.connect(g); g.connect(audioCtx.destination); o.start(); o.stop(audioCtx.currentTime+d);
+}
+
+cvs.width = window.innerWidth; cvs.height = window.innerHeight;
+
+function isWall(x, y, r) {
+    return walls.some(w => x+r > w.x && x-r < w.x+w.w && y+r > w.y && y-r < w.y+w.h);
+}
+
+function build() {
+    walls = []; nodes = [];
+    const W = cvs.width, H = cvs.height, B = 25;
+    // Perimeter
+    walls.push({x:0, y:0, w:W, h:B}, {x:0, y:H-B, w:W, h:B}, {x:0, y:0, w:B, h:H}, {x:W-B, y:0, w:B, h:H});
+    
+    // Hotline Miami Style Grid with guaranteed connectivity
+    const cw = (W-B*2)/3, ch = (H-B*2)/2, d = 170; // Larger doors
+    
+    // Vert walls with doors
+    for(let i=1; i<3; i++) {
+        let x = B+i*cw, gy = B+100+Math.random()*(H-B*2-300);
+        walls.push({x, y:B, w:B, h:gy-B}, {x, y:gy+d, w:B, h:H-(gy+d)-B});
+    }
+    // Horiz wall with doors
+    for(let i=0; i<3; i++) {
+        let sx = B+i*cw, gx = sx+50+Math.random()*(cw-d-100), my = B+ch;
+        walls.push({x:sx, y:my, w:gx-sx, h:B}, {x:gx+d, y:my, w:(sx+cw)-(gx+d), h:B});
+    }
+
+    // Pathfinding Nodes - густая сетка для нормального обхода стен
+    for(let x=45; x<W; x+=70) {
+        for(let y=45; y<H; y+=70) {
+            if(!isWall(x, y, 35)) nodes.push({x, y});
+        }
+    }
+    // добавим еще случайных узлов в больших комнатах
+    for(let i=0; i<60; i++) {
+        let nx = 50 + Math.random() * (W-100);
+        let ny = 50 + Math.random() * (H-100);
+        if(!isWall(nx, ny, 30) && !nodes.some(n => Math.hypot(n.x-nx, n.y-ny) < 45)) {
+            nodes.push({x: nx, y: ny});
+        }
+    }
+}
+
+function canSee(x1, y1, x2, y2, r=8) {
+    let dist = Math.hypot(x2-x1, y2-y1);
+    let steps = Math.ceil(dist / 12);
+    for(let i=0; i<=steps; i++) {
+        let t = i / steps;
+        let cx = x1 + (x2-x1)*t;
+        let cy = y1 + (y2-y1)*t;
+        if(isWall(cx, cy, r)) return false;
+    }
+    return true;
+}
+
+// НАХУЙ НОРМАЛЬНЫЙ ПОИСК ПУТИ - ДИКСТРА ПО УЗЛАМ
+function findPathToPlayer(enemy) {
+    if(nodes.length === 0) return null;
+    
+    // находим ближайший узел к врагу (видимый)
+    let startNode = null;
+    let startDist = Infinity;
+    for(let n of nodes) {
+        if(canSee(enemy.x, enemy.y, n.x, n.y, 10)) {
+            let d = Math.hypot(n.x - enemy.x, n.y - enemy.y);
+            if(d < startDist) {
+                startDist = d;
+                startNode = n;
+            }
+        }
+    }
+    if(!startNode) return null;
+    
+    // находим ближайший узел к игроку (видимый)
+    let targetNode = null;
+    let targetDist = Infinity;
+    for(let n of nodes) {
+        if(canSee(player.x, player.y, n.x, n.y, 10)) {
+            let d = Math.hypot(n.x - player.x, n.y - player.y);
+            if(d < targetDist) {
+                targetDist = d;
+                targetNode = n;
+            }
+        }
+    }
+    if(!targetNode) return null;
+    
+    // если есть прямой видимый путь к игроку - бежим напрямую
+    if(canSee(enemy.x, enemy.y, player.x, player.y, 12)) {
+        return { x: player.x, y: player.y, direct: true };
+    }
+    
+    // BFS по узлам
+    let queue = [{node: startNode, path: [startNode]}];
+    let visited = new Set();
+    visited.add(startNode);
+    
+    while(queue.length > 0) {
+        let {node, path} = queue.shift();
+        
+        if(node === targetNode || Math.hypot(node.x - targetNode.x, node.y - targetNode.y) < 60) {
+            // нашли путь, возвращаем следующий шаг
+            if(path.length > 1) return path[1];
+            return targetNode;
+        }
+        
+        // ищем соседние узлы (видимые)
+        for(let neighbor of nodes) {
+            if(visited.has(neighbor)) continue;
+            if(canSee(node.x, node.y, neighbor.x, neighbor.y, 12)) {
+                visited.add(neighbor);
+                queue.push({node: neighbor, path: [...path, neighbor]});
+            }
+        }
+    }
+    
+    // если путь не найден - двигаемся к ближайшему видимому узлу в сторону игрока
+    let best = null;
+    let bestScore = -Infinity;
+    for(let n of nodes) {
+        if(canSee(enemy.x, enemy.y, n.x, n.y, 12)) {
+            let toPlayer = Math.hypot(player.x - n.x, player.y - n.y);
+            let score = -toPlayer;
+            if(score > bestScore) {
+                bestScore = score;
+                best = n;
+            }
+        }
+    }
+    return best;
+}
+
+function start() {
+    state = 'PLAY'; overlay.style.display = 'none'; build();
+    let px, py; 
+    do { 
+        px = 100+Math.random()*(cvs.width-200); 
+        py = 100+Math.random()*(cvs.height-200); 
+    } while(isWall(px, py, 30));
+    player = { x: px, y: py, a: 0, s: 7, r: 22 };
+    enemies = []; bullets = []; blood = []; score = 0;
+    for(let i=0; i<14; i++) {
+        let rx, ry; 
+        do { 
+            rx = Math.random()*cvs.width; 
+            ry = Math.random()*cvs.height; 
+        } while(isWall(rx, ry, 40) || Math.hypot(rx-px, ry-py)<400);
+        enemies.push({ 
+            x: rx, y: ry, a: Math.random()*Math.PI*2, s: 4.5, r: 20, 
+            alert: false, pathTarget: null, stuckTimer: 0, lastX: rx, lastY: ry
+        });
+    }
+}
+
+function update() {
+    if(state !== 'PLAY') return;
+    frame++;
+
+    if(keys['KeyW']) player.y -= player.s; 
+    if(keys['KeyS']) player.y += player.s;
+    if(keys['KeyA']) player.x -= player.s; 
+    if(keys['KeyD']) player.x += player.s;
+
+    [player, ...enemies].forEach(obj => {
+        walls.forEach(w => {
+            let cx = Math.max(w.x, Math.min(obj.x, w.x+w.w)), cy = Math.max(w.y, Math.min(obj.y, w.y+w.h));
+            let d = Math.hypot(obj.x-cx, obj.y-cy);
+            if(d < obj.r) {
+                let o = obj.r - d; 
+                obj.x += ((obj.x-cx)/d)*o; 
+                obj.y += ((obj.y-cy)/d)*o;
+            }
+        });
+    });
+
+    // обновляем врагов с нормальным обходом стен
+    for(let i=0; i<enemies.length; i++) {
+        let en = enemies[i];
+        
+        // проверка на застревание
+        let moved = Math.hypot(en.x - en.lastX, en.y - en.lastY);
+        if(moved < 1.5) en.stuckTimer = (en.stuckTimer || 0) + 1;
+        else en.stuckTimer = 0;
+        en.lastX = en.x;
+        en.lastY = en.y;
+        
+        let distToPlayer = Math.hypot(en.x-player.x, en.y-player.y);
+        let seePlayer = canSee(en.x, en.y, player.x, player.y, 12);
+        
+        // активация агрессии
+        if(seePlayer && distToPlayer < 700) en.alert = true;
+        if(distToPlayer < 350) en.alert = true;
+        
+        // разделение врагов
+        for(let j=0; j<enemies.length; j++) {
+            if(i === j) continue;
+            let other = enemies[j];
+            let d = Math.hypot(en.x-other.x, en.y-other.y);
+            if(d < 48) {
+                let angle = Math.atan2(en.y-other.y, en.x-other.x);
+                let push = (48 - d) * 0.12;
+                en.x += Math.cos(angle) * push;
+                en.y += Math.sin(angle) * push;
+            }
+        }
+        
+        if(en.alert) {
+            // если застрял - дергаем рандомно
+            if(en.stuckTimer > 15) {
+                en.a += (Math.random() - 0.5) * 1.8;
+                en.x += Math.cos(en.a) * en.s;
+                en.y += Math.sin(en.a) * en.s;
+                en.stuckTimer = 0;
+            } else {
+                // УМНЫЙ ОБХОД СТЕН - ИСПОЛЬЗУЕМ PATHFINDING
+                let nextTarget = null;
+                
+                // прямой путь к игроку если видим
+                if(seePlayer) {
+                    nextTarget = { x: player.x, y: player.y, direct: true };
+                    en.pathTarget = null;
+                } else {
+                    // ищем путь через узлы
+                    if(!en.pathTarget || Math.hypot(en.x - en.pathTarget.x, en.y - en.pathTarget.y) < 35 || 
+                       (en.pathTarget.direct && !canSee(en.x, en.y, en.pathTarget.x, en.pathTarget.y, 12))) {
+                        let pathNode = findPathToPlayer(en);
+                        if(pathNode) en.pathTarget = pathNode;
+                    }
+                    if(en.pathTarget) nextTarget = en.pathTarget;
+                }
+                
+                if(nextTarget) {
+                    let targetAngle = Math.atan2(nextTarget.y - en.y, nextTarget.x - en.x);
+                    en.a = targetAngle;
+                    en.x += Math.cos(en.a) * en.s;
+                    en.y += Math.sin(en.a) * en.s;
+                } else {
+                    // fallback - движение в сторону игрока с обходом через raycast
+                    let angleToPlayer = Math.atan2(player.y - en.y, player.x - en.x);
+                    let testX = en.x + Math.cos(angleToPlayer) * 25;
+                    let testY = en.y + Math.sin(angleToPlayer) * 25;
+                    if(!isWall(testX, testY, en.r-2)) {
+                        en.a = angleToPlayer;
+                    } else {
+                        // ищем свободное направление
+                        for(let off = -1.2; off <= 1.2; off += 0.6) {
+                            let tryAngle = angleToPlayer + off;
+                            let tx = en.x + Math.cos(tryAngle) * 25;
+                            let ty = en.y + Math.sin(tryAngle) * 25;
+                            if(!isWall(tx, ty, en.r-2)) {
+                                en.a = tryAngle;
+                                break;
+                            }
+                        }
+                    }
+                    en.x += Math.cos(en.a) * en.s;
+                    en.y += Math.sin(en.a) * en.s;
+                }
+            }
+        } else {
+            // патрулирование - ходят по комнате
+            if(!en.patrolTarget || Math.hypot(en.x - en.patrolTarget.x, en.y - en.patrolTarget.y) < 40) {
+                let possible = nodes.filter(n => canSee(en.x, en.y, n.x, n.y, 12));
+                if(possible.length) en.patrolTarget = possible[Math.floor(Math.random() * possible.length)];
+                else if(nodes.length) en.patrolTarget = nodes[Math.floor(Math.random() * nodes.length)];
+            }
+            if(en.patrolTarget) {
+                let angle = Math.atan2(en.patrolTarget.y - en.y, en.patrolTarget.x - en.x);
+                en.a = angle;
+                en.x += Math.cos(angle) * (en.s * 0.7);
+                en.y += Math.sin(angle) * (en.s * 0.7);
+            } else {
+                en.a += (Math.random() - 0.5) * 0.8;
+                en.x += Math.cos(en.a) * 2.5;
+                en.y += Math.sin(en.a) * 2.5;
+            }
+        }
+        
+        // принудительный выход из стен
+        walls.forEach(w => {
+            let cx = Math.max(w.x, Math.min(en.x, w.x+w.w));
+            let cy = Math.max(w.y, Math.min(en.y, w.y+w.h));
+            let d = Math.hypot(en.x-cx, en.y-cy);
+            if(d < en.r) {
+                let o = en.r - d;
+                if(d > 0.01) {
+                    en.x += ((en.x-cx)/d)*o;
+                    en.y += ((en.y-cy)/d)*o;
+                } else {
+                    en.x += (Math.random() - 0.5) * o;
+                    en.y += (Math.random() - 0.5) * o;
+                }
+            }
+        });
+        
+        // проверка коллизии с пулями
+        for(let bi=0; bi<bullets.length; bi++) {
+            let b = bullets[bi];
+            if(Math.hypot(b.x-en.x, b.y-en.y) < 35) {
+                enemies.splice(i, 1); 
+                bullets.splice(bi, 1); 
+                score++; 
+                shake = 25;
+                sfx(60, 0.2, 'triangle');
+                for(let k=0; k<25; k++) blood.push({x:en.x, y:en.y, vx:(Math.random()-0.5)*20, vy:(Math.random()-0.5)*20, r:Math.random()*12+4});
+                i--;
+                break;
+            }
+        }
+        
+        // проверка смерти игрока
+        if(enemies[i] && Math.hypot(player.x-enemies[i].x, player.y-enemies[i].y) < 38) { 
+            state = 'MENU'; 
+            overlay.style.display = 'flex'; 
+            if(mainGain) mainGain.gain.setTargetAtTime(0, audioCtx.currentTime, 0.1); 
+            return;
+        }
+    }
+    
+    // пули
+    for(let bi=0; bi<bullets.length; bi++) { 
+        let b = bullets[bi];
+        b.x += b.vx; 
+        b.y += b.vy; 
+        if(isWall(b.x, b.y, 5)) bullets.splice(bi, 1); 
+    }
+    
+    statUI.innerText = `KILLS: ${score} | TARGETS: ${enemies.length}`;
+    if(enemies.length === 0 && state === 'PLAY') start();
+}
+
+function draw() {
+    ctx.setTransform(1, 0, 0, 1, 0, 0); 
+    
+    let hue = 260 + Math.sin(frame*0.02)*10;
+    ctx.fillStyle = `hsl(${hue}, 100%, 5%)`; 
+    ctx.fillRect(0, 0, cvs.width, cvs.height);
+    
+    if(shake > 0.5) { 
+        let sx = Math.random()*shake-shake/2, sy = Math.random()*shake-shake/2;
+        ctx.translate(sx, sy); 
+        shake *= 0.88; 
+    }
+    
+    blood.forEach((b, i) => {
+        ctx.fillStyle = 'rgba(255, 0, 100, 0.6)'; 
+        ctx.beginPath(); 
+        ctx.arc(b.x, b.y, b.r, 0, 7); 
+        ctx.fill();
+        b.x += b.vx; 
+        b.y += b.vy; 
+        b.vx *= 0.9; 
+        b.vy *= 0.9; 
+        b.r *= 0.99; 
+        if(b.r < 1) blood.splice(i, 1);
+    });
+
+    walls.forEach(w => { 
+        ctx.fillStyle = '#100020';
+        ctx.fillRect(w.x, w.y, w.w, w.h);
+        ctx.save();
+        ctx.strokeStyle = '#f0f'; 
+        ctx.lineWidth = 4;
+        ctx.shadowBlur = 15;
+        ctx.shadowColor = '#f0f';
+        ctx.strokeRect(w.x, w.y, w.w, w.h);
+        ctx.restore();
+    });
+
+    if(state === 'PLAY') {
+        enemies.forEach(en => {
+            ctx.save(); 
+            ctx.translate(en.x, en.y); 
+            ctx.rotate(en.a);
+            ctx.fillStyle = '#ff0'; 
+            ctx.shadowBlur = en.alert ? 15 : 0; 
+            ctx.shadowColor = '#ff0';
+            ctx.fillRect(-20, -20, 40, 40);
+            ctx.fillStyle = '#000'; 
+            ctx.fillRect(10, -8, 10, 16); 
+            ctx.restore();
+        });
+        
+        bullets.forEach(b => { 
+            ctx.fillStyle = '#fff'; 
+            ctx.shadowBlur = 10; 
+            ctx.shadowColor = '#fff';
+            ctx.fillRect(b.x-4, b.y-4, 8, 8); 
+        });
+        
+        ctx.save(); 
+        ctx.translate(player.x, player.y); 
+        ctx.rotate(player.a);
+        ctx.shadowBlur = 25; 
+        ctx.shadowColor = '#0ff'; 
+        ctx.fillStyle = '#fff'; 
+        ctx.fillRect(-22, -22, 44, 44); 
+        ctx.restore();
+    }
+    
+    update(); 
+    requestAnimationFrame(draw);
+}
+
+window.onkeydown = e => keys[e.code] = true; 
+window.onkeyup = e => keys[e.code] = false;
+window.onmousemove = e => { if(player) player.a = Math.atan2(e.clientY-player.y, e.clientX-player.x); };
+window.onmousedown = () => {
+    if(state === 'PLAY' && Date.now()-(player.lastShot||0) > 125) {
+        player.lastShot = Date.now(); 
+        shake = 16; 
+        sfx(160, 0.1);
+        bullets.push({ x: player.x, y: player.y, vx: Math.cos(player.a)*36, vy: Math.sin(player.a)*36 });
+        enemies.forEach(en => { 
+            if(Math.hypot(en.x-player.x, en.y-player.y) < 850) en.alert = true; 
+        });
+    }
+};
+
+draw();
+</script>
+</body>
+</html>
